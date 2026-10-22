@@ -56,7 +56,8 @@ jobs:
           docker run --rm "media-downloader-bot:$GITHUB_SHA" -h
           docker run --rm --entrypoint yt-dlp "media-downloader-bot:$GITHUB_SHA" --version
           docker run --rm --entrypoint ffmpeg "media-downloader-bot:$GITHUB_SHA" -version
-          docker save "media-downloader-bot:$GITHUB_SHA" | gzip > image.tar.gz
+          docker pull redis:7-alpine
+          docker save "media-downloader-bot:$GITHUB_SHA" redis:7-alpine | gzip > image.tar.gz
           tar -czf release.tgz image.tar.gz docker-compose.yml config.yaml deploy/deploy.sh
       - name: Deploy over pinned SSH
         env:

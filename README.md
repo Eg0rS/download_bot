@@ -49,7 +49,7 @@ go build ./cmd/bot
 
 Workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
-CI проверяет форматирование, зависимости, go vet, тесты с детектором гонок и сборку. На push в master runner собирает Docker-образ с тегом SHA коммита, передаёт его по SSH и запускает Compose. Production job сериализован; сервер дополнительно использует flock.
+CI проверяет форматирование, зависимости, go vet, тесты с детектором гонок и сборку. На push в master runner собирает Docker-образ с тегом SHA коммита, передаёт его вместе с образом Redis по SSH и запускает Compose. Серверу не требуется доступ к Docker Hub. Production job сериализован; сервер дополнительно использует flock.
 
 Секреты GitHub Actions:
 

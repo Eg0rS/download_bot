@@ -20,7 +20,7 @@ rollback() {
   if [ "$status" -ne 0 ] && [ -n "$previous" ] && [ -f "$previous/REVISION" ]; then
     echo "Deployment failed; restoring previous release" >&2
     export BOT_IMAGE="media-downloader-bot:$(cat "$previous/REVISION")"
-    docker compose --env-file "$base/.env" -p media-downloader -f "$previous/docker-compose.yml" up -d --no-build --wait --wait-timeout 180 || true
+    docker compose --env-file "$base/.env" -p media-downloader -f "$previous/docker-compose.yml" up -d --no-build --pull never --wait --wait-timeout 180 || true
   fi
   exit "$status"
 }
@@ -29,7 +29,7 @@ export BOT_IMAGE="media-downloader-bot:$revision"
 compose() { docker compose --env-file "$base/.env" -p media-downloader -f "$release/docker-compose.yml" "$@"; }
 compose config --quiet
 # Keep the previous polling process stopped before starting a new one.
-compose up -d --no-build --wait --wait-timeout 180
+compose up -d --no-build --pull never --wait --wait-timeout 180
 if ! curl --fail --silent --max-time 5 http://127.0.0.1:8080/health; then
   echo "Health check failed" >&2
   exit 1
