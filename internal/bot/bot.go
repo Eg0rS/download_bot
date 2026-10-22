@@ -67,6 +67,11 @@ func NewBot(cfg *config.Config, db *gorm.DB, registry ExtractorRegistry, taskQue
 	if err != nil {
 		return nil, fmt.Errorf("Telegram initialization: %s", strings.ReplaceAll(err.Error(), cfg.Telegram.BotToken, "[redacted]"))
 	}
+	if !cfg.Telegram.Webhook.Enabled {
+		if err := b.RemoveWebhook(); err != nil {
+			return nil, fmt.Errorf("remove webhook: %s", strings.ReplaceAll(err.Error(), cfg.Telegram.BotToken, "[redacted]"))
+		}
+	}
 
 	bot := &Bot{
 		bot:       b,
