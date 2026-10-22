@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: media-downloader-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: media-downloader-bot
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - APP_ENV=production
+      - LOG_LEVEL=info
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - DB_DSN=file:/data/bot.db?cache=shared&mode=rwc
+      - TEMP_DIR=/tmp/media-downloader
+      - MAX_FILE_SIZE_MB=2048
+      - DOWNLOADER_MAX_CONCURRENT=3
+      - DOWNLOADER_TIMEOUT_MINUTES=30
+      - YOUTUBE_ENABLED=true
+      - TIKTOK_ENABLED=true
+      - INSTAGRAM_ENABLED=true
+      - TWITTER_ENABLED=true
+      - SOUNDCLOUD_ENABLED=false
+      - VK_ENABLED=false
+      - GENERIC_ENABLED=true
+      - ADMIN_IDS=${ADMIN_IDS}
+      - WEBHOOK_ENABLED=${WEBHOOK_ENABLED:-false}
+      - WEBHOOK_HOST=${WEBHOOK_HOST}
+      - WEBHOOK_PORT=8080
+      - WEBHOOK_PATH=/webhook
+    volumes:
+      - bot_data:/data
+      - temp_data:/tmp/media-downloader
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "8080:8080"  # for webhook if enabled
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  redis_data:
+  bot_data:
+  temp_data:

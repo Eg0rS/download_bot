@@ -1,0 +1,50 @@
+app:
+  env: "development"  # development, production
+  log_level: "debug"  # debug, info, warn, error
+  temp_dir: "/tmp/media-downloader"
+  max_file_size_mb: 2048  # Telegram Premium limit
+
+telegram:
+  bot_token: ""  # из переменной окружения BOT_TOKEN
+  admin_ids: []  # список user_id админов
+  webhook:
+    enabled: false
+    host: ""
+    port: 8080
+    path: "/webhook"
+
+redis:
+  addr: "redis:6379"
+  password: ""
+  db: 0
+  pool_size: 10
+
+database:
+  driver: "sqlite"
+  dsn: "file:/data/bot.db?cache=shared&mode=rwc"
+
+downloader:
+  max_concurrent: 3
+  chunk_size_mb: 8
+  timeout_minutes: 30
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+platforms:
+  youtube:
+    enabled: true
+    quality_preference: "best"  # best, 1080p, 720p, 480p, audio_only
+    download_subtitles: true
+    subtitle_langs: ["ru", "en"]
+  tiktok:
+    enabled: true
+    watermark: false
+  instagram:
+    enabled: true
+  twitter:
+    enabled: true
+  soundcloud:
+    enabled: true
+  vk:
+    enabled: false  # требует отдельного токена
+  generic:
+    enabled: true  # fallback через yt-dlp/rod
