@@ -2,12 +2,15 @@ package bot
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	tele "gopkg.in/telebot.v3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
@@ -203,6 +206,37 @@ func TestCancelledPendingTaskDoesNotStartDownload(t *testing.T) {
 	case <-r.started:
 		t.Fatal("cancelled task started downloading")
 	default:
+	}
+}
+
+type messageContext struct {
+	tele.Context
+	text string
+}
+
+func (c *messageContext) Send(what interface{}, opts ...interface{}) error {
+	c.text = what.(string)
+	return nil
+}
+
+func TestRussianCommandMessages(t *testing.T) {
+	b := &Bot{cfg: setupTestConfig()}
+	for _, test := range []struct {
+		name     string
+		handler  func(tele.Context) error
+		expected string
+	}{
+		{"start", b.handleStart, "Пришли ссылку"},
+		{"help", b.handleHelp, "Максимальный размер"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := &messageContext{}
+			require.NoError(t, test.handler(c))
+			require.True(t, utf8.ValidString(c.text))
+			require.Contains(t, c.text, test.expected)
+			require.False(t, strings.Contains(c.text, "??"), "Cyrillic was replaced by question marks")
+			require.NotContains(t, c.text, "\uFFFD")
+		})
 	}
 }
 
