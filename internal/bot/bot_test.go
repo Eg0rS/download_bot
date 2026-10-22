@@ -191,6 +191,21 @@ func TestShutdownInterruptsDownloadForRequeue(t *testing.T) {
 	require.NotEqual(t, models.StatusFailed, persisted.Status)
 }
 
+func TestCancelledPendingTaskDoesNotStartDownload(t *testing.T) {
+	db := setupTestDB()
+	r := &blockingRegistry{started: make(chan struct{})}
+	b := &Bot{cfg: setupTestConfig(), db: db, registry: r, active: make(map[uint]activeTask)}
+	task := &models.DownloadTask{UserID: 1, ChatID: 1, URL: "https://youtu.be/test", Status: models.StatusPending}
+	require.NoError(t, db.Create(task).Error)
+	b.cancelTask(task)
+	require.NoError(t, b.ProcessTask(task))
+	select {
+	case <-r.started:
+		t.Fatal("cancelled task started downloading")
+	default:
+	}
+}
+
 func TestBot_FormatBytes(t *testing.T) {
 	tests := []struct {
 		input    int64

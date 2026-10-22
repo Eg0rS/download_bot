@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -94,8 +95,14 @@ return redis.call('ZADD',KEYS[1],ARGV[3],ARGV[2])
 `)
 
 func (q *TaskQueue) Requeue(req DownloadRequest) error {
+	return q.requeue(req, true)
+}
+
+func (q *TaskQueue) requeue(req DownloadRequest, incrementAttempt bool) error {
 	old, _ := json.Marshal(req)
-	req.Attempts++
+	if incrementAttempt {
+		req.Attempts++
+	}
 	data, _ := json.Marshal(req)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -197,6 +204,12 @@ func (wp *WorkerPool) worker(id int) {
 			}()
 			return wp.handler(task)
 		}()
+		if errors.Is(err, context.Canceled) {
+			if retryErr := wp.queue.requeue(task, false); retryErr != nil {
+				logrus.Errorf("Return interrupted task: %v", retryErr)
+			}
+			return
+		}
 		if err != nil && task.Attempts < 2 {
 			if retryErr := wp.queue.Requeue(task); retryErr != nil {
 				logrus.Errorf("Requeue: %v", retryErr)

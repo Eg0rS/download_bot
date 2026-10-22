@@ -452,6 +452,19 @@ func (b *Bot) ProcessTask(task *models.DownloadTask) (processErr error) {
 		cancel()
 		return context.Canceled
 	}
+	// Share the cancellation lock while checking persisted state: /cancel may
+	// have cancelled this pending task after the worker fetched it from SQLite.
+	var persisted models.DownloadTask
+	if err := b.db.First(&persisted, task.ID).Error; err != nil {
+		b.mu.Unlock()
+		cancel()
+		return err
+	}
+	if persisted.Status == models.StatusFailed || persisted.Status == models.StatusDone {
+		b.mu.Unlock()
+		cancel()
+		return nil
+	}
 	b.active[task.ID] = activeTask{userID: task.UserID, chatID: task.ChatID, cancel: cancel}
 	b.mu.Unlock()
 	defer func() {
