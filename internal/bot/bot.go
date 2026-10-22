@@ -539,6 +539,9 @@ func (b *Bot) sendFile(task *models.DownloadTask, result *extractor.DownloadResu
 	if fileSize > maxSize {
 		return fmt.Errorf("file too large: %d MB > %d MB limit", fileSize/(1024*1024), b.cfg.App.MaxFileSizeMB)
 	}
+	if len(result.Photos) > 0 {
+		return b.sendPhotos(task, result)
+	}
 
 	// Caption
 	caption := fmt.Sprintf("✅ %s\n📥 %s\n📊 %s\n⏱ %s",
@@ -570,6 +573,48 @@ func (b *Bot) sendFile(task *models.DownloadTask, result *extractor.DownloadResu
 	task.MessageID = sent.ID
 	b.db.Model(task).Update("message_id", task.MessageID)
 	return nil
+}
+
+func (b *Bot) sendPhotos(task *models.DownloadTask, result *extractor.DownloadResult) error {
+	caption := fmt.Sprintf("📷 %s\n%d фото · %s", truncate(result.Title, 400), len(result.Photos), formatBytes(result.FileSize))
+	var lastID int
+	for start := 0; start < len(result.Photos); {
+		count := min(10, len(result.Photos)-start)
+		if len(result.Photos)-start == 11 {
+			count = 9
+		} // Keep the last group at two photos.
+		album := make(tele.Album, 0, count)
+		for i := start; i < start+count; i++ {
+			p := result.Photos[i]
+			if p.FileSize > 10*1024*1024 {
+				return fmt.Errorf("фотография %d превышает лимит Telegram", i+1)
+			}
+			photo := &tele.Photo{File: tele.FromDisk(p.FilePath), Width: p.Width, Height: p.Height}
+			if i == 0 {
+				photo.Caption = caption
+			}
+			album = append(album, photo)
+		}
+		if count == 1 {
+			sent, err := b.bot.Send(&tele.Chat{ID: task.ChatID}, album[0])
+			if err != nil {
+				return fmt.Errorf("отправка фотографии %d: %w", start+1, err)
+			}
+			lastID = sent.ID
+		} else {
+			sent, err := b.bot.SendAlbum(&tele.Chat{ID: task.ChatID}, album)
+			if err != nil {
+				return fmt.Errorf("отправка фотографий %d–%d: %w", start+1, start+count, err)
+			}
+			if len(sent) == 0 {
+				return fmt.Errorf("Telegram не подтвердил отправку фотоальбома")
+			}
+			lastID = sent[len(sent)-1].ID
+		}
+		start += count
+	}
+	task.MessageID = lastID
+	return b.db.Model(task).Update("message_id", lastID).Error
 }
 
 func (b *Bot) handleError(task *models.DownloadTask, err error) {

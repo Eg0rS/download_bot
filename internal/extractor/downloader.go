@@ -84,6 +84,7 @@ type HTTPDownloader struct {
 	client   *http.Client
 	tempDir  string
 	maxBytes int64
+	headers  http.Header
 }
 
 func maxDownloadBytes() int64 {
@@ -112,6 +113,9 @@ func (d *HTTPDownloader) Download(ctx context.Context, rawURL, dest string, prog
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
+	}
+	if d.headers != nil {
+		req.Header = d.headers.Clone()
 	}
 	resp, err := d.client.Do(req)
 	if err != nil {

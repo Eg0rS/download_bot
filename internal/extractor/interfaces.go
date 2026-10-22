@@ -6,21 +6,23 @@ import (
 )
 
 type MediaFormat struct {
-	FormatID string `json:"format_id"`
-	Ext      string `json:"ext"`
-	Quality  string `json:"quality"` // 1080p, 720p, audio_only, etc.
-	Width    int    `json:"width"`
-	Height   int    `json:"height"`
-	FPS      int    `json:"fps"`
-	VCodec   string `json:"vcodec"`
-	ACodec   string `json:"acodec"`
-	Bitrate  int    `json:"bitrate"`   // kbps
-	FileSize int64  `json:"file_size"` // bytes, may be 0 if unknown
-	Protocol string `json:"protocol"`  // https, m3u8, dash
-	URL      string `json:"url"`       // direct download URL
-	IsAudio  bool   `json:"is_audio"`
-	IsVideo  bool   `json:"is_video"`
-	Language string `json:"language"` // for audio/subtitles
+	FormatID string        `json:"format_id"`
+	Ext      string        `json:"ext"`
+	Quality  string        `json:"quality"` // 1080p, 720p, audio_only, etc.
+	Width    int           `json:"width"`
+	Height   int           `json:"height"`
+	FPS      int           `json:"fps"`
+	VCodec   string        `json:"vcodec"`
+	ACodec   string        `json:"acodec"`
+	Bitrate  int           `json:"bitrate"`   // kbps
+	FileSize int64         `json:"file_size"` // bytes, may be 0 if unknown
+	Protocol string        `json:"protocol"`  // https, m3u8, dash
+	URL      string        `json:"url"`       // direct download URL
+	IsAudio  bool          `json:"is_audio"`
+	IsVideo  bool          `json:"is_video"`
+	IsPhoto  bool          `json:"is_photo"`
+	Images   []ImageSource `json:"images,omitempty"`
+	Language string        `json:"language"` // for audio/subtitles
 }
 
 type MediaInfo struct {
@@ -35,6 +37,7 @@ type MediaInfo struct {
 	LikeCount     int64                      `json:"like_count"`
 	Tags          []string                   `json:"tags"`
 	Formats       []MediaFormat              `json:"formats"`
+	Images        []ImageSource              `json:"images,omitempty"`
 	Subtitles     map[string][]SubtitleTrack `json:"subtitles"` // lang -> tracks
 	Platform      string                     `json:"platform"`
 	URL           string                     `json:"url"`
@@ -51,13 +54,27 @@ type SubtitleTrack struct {
 }
 
 type DownloadResult struct {
-	FilePath     string      `json:"file_path"`
-	Format       MediaFormat `json:"format"`
-	Title        string      `json:"title"`
-	Thumbnail    string      `json:"thumbnail"`
-	Duration     int         `json:"duration"`
-	FileSize     int64       `json:"file_size"`
-	DownloadedAt time.Time   `json:"downloaded_at"`
+	FilePath     string            `json:"file_path"`
+	Format       MediaFormat       `json:"format"`
+	Title        string            `json:"title"`
+	Thumbnail    string            `json:"thumbnail"`
+	Duration     int               `json:"duration"`
+	FileSize     int64             `json:"file_size"`
+	DownloadedAt time.Time         `json:"downloaded_at"`
+	Photos       []DownloadedPhoto `json:"photos,omitempty"`
+}
+
+type ImageSource struct {
+	URLs   []string `json:"urls"`
+	Width  int      `json:"width"`
+	Height int      `json:"height"`
+}
+
+type DownloadedPhoto struct {
+	FilePath string `json:"file_path"`
+	FileSize int64  `json:"file_size"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
 }
 
 type ProgressFunc func(downloaded, total int64, speed float64, eta time.Duration)
