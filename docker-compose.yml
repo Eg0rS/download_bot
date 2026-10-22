@@ -1,65 +1,62 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
-    container_name: media-downloader-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      test: ["CMD","redis-cli","ping"]
+      interval: 5s
       timeout: 3s
-      retries: 3
+      retries: 12
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
   bot:
+    image: ${BOT_IMAGE:-media-downloader-bot:local}
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: media-downloader-bot
     restart: unless-stopped
+    init: true
+    stop_grace_period: 150s
     depends_on:
       redis:
         condition: service_healthy
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - APP_ENV=production
-      - LOG_LEVEL=info
-      - REDIS_ADDR=redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-      - DB_DSN=file:/data/bot.db?cache=shared&mode=rwc
-      - TEMP_DIR=/tmp/media-downloader
-      - MAX_FILE_SIZE_MB=2048
-      - DOWNLOADER_MAX_CONCURRENT=3
-      - DOWNLOADER_TIMEOUT_MINUTES=30
-      - YOUTUBE_ENABLED=true
-      - TIKTOK_ENABLED=true
-      - INSTAGRAM_ENABLED=true
-      - TWITTER_ENABLED=true
-      - SOUNDCLOUD_ENABLED=false
-      - VK_ENABLED=false
-      - GENERIC_ENABLED=true
-      - ADMIN_IDS=${ADMIN_IDS}
-      - WEBHOOK_ENABLED=${WEBHOOK_ENABLED:-false}
-      - WEBHOOK_HOST=${WEBHOOK_HOST}
-      - WEBHOOK_PORT=8080
-      - WEBHOOK_PATH=/webhook
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in .env}
+      ADMIN_IDS: ${ADMIN_IDS:-}
+      APP_ENV: production
+      LOG_LEVEL: info
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      DB_DSN: file:/data/bot.db?cache=shared&mode=rwc
+      TEMP_DIR: /tmp/media-downloader
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-50}
+      DOWNLOADER_MAX_CONCURRENT: ${DOWNLOADER_MAX_CONCURRENT:-2}
+      DOWNLOADER_TIMEOUT_MINUTES: ${DOWNLOADER_TIMEOUT_MINUTES:-10}
+      WEBHOOK_ENABLED: "false"
+      NODE_OPTIONS: --max-old-space-size=128
     volumes:
       - bot_data:/data
-      - temp_data:/tmp/media-downloader
       - ./config.yaml:/app/config.yaml:ro
+    tmpfs:
+      - /tmp/media-downloader:uid=1000,gid=1000,mode=0700,size=512m
     ports:
-      - "8080:8080"  # for webhook if enabled
+      - "127.0.0.1:8080:8080"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+      test: ["CMD","wget","-q","--spider","http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
 volumes:
   redis_data:
   bot_data:
-  temp_data:

@@ -3,16 +3,15 @@ package extractor
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
 )
 
 type Registry struct {
-	mu          sync.RWMutex
-	extractors  map[string]Extractor
-	ordered     []Extractor
+	mu         sync.RWMutex
+	extractors map[string]Extractor
+	ordered    []Extractor
 }
 
 func NewRegistry() *Registry {
@@ -28,7 +27,14 @@ func (r *Registry) Register(e Extractor) {
 
 	name := e.Name()
 	if _, exists := r.extractors[name]; exists {
-		logrus.Warnf("Extractor %s already registered, replacing", name)
+		for i, previous := range r.ordered {
+			if previous.Name() == name {
+				r.ordered[i] = e
+				break
+			}
+		}
+		r.extractors[name] = e
+		return
 	}
 	r.extractors[name] = e
 	r.ordered = append(r.ordered, e)
@@ -75,6 +81,9 @@ func (r *Registry) Extract(ctx context.Context, url string) (*MediaInfo, error) 
 }
 
 func (r *Registry) Download(ctx context.Context, url string, qualityPref string, audioOnly bool, progress ProgressFunc) (*DownloadResult, error) {
+	if err := ValidateURL(url); err != nil {
+		return nil, err
+	}
 	e, err := r.FindForURL(url)
 	if err != nil {
 		return nil, err
@@ -91,7 +100,15 @@ func (r *Registry) Download(ctx context.Context, url string, qualityPref string,
 	}
 
 	logrus.Infof("Downloading with format: %s (%s, %s)", format.FormatID, format.Quality, format.Ext)
-	return e.Download(ctx, url, format, progress)
+	result, err := e.Download(ctx, url, format, progress)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil || result.FilePath == "" {
+		return nil, fmt.Errorf("extractor returned no file")
+	}
+	result.Title, result.Duration, result.Thumbnail = info.Title, info.Duration, info.Thumbnail
+	return result, nil
 }
 
 func (r *Registry) Close() error {

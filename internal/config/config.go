@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -11,24 +12,24 @@ import (
 )
 
 type Config struct {
-	App      AppConfig      `yaml:"app"`
-	Telegram TelegramConfig `yaml:"telegram"`
-	Redis    RedisConfig    `yaml:"redis"`
-	Database DatabaseConfig `yaml:"database"`
+	App        AppConfig        `yaml:"app"`
+	Telegram   TelegramConfig   `yaml:"telegram"`
+	Redis      RedisConfig      `yaml:"redis"`
+	Database   DatabaseConfig   `yaml:"database"`
 	Downloader DownloaderConfig `yaml:"downloader"`
-	Platforms PlatformsConfig `yaml:"platforms"`
+	Platforms  PlatformsConfig  `yaml:"platforms"`
 }
 
 type AppConfig struct {
-	Env         string `yaml:"env"`
-	LogLevel    string `yaml:"log_level"`
-	TempDir     string `yaml:"temp_dir"`
-	MaxFileSizeMB int  `yaml:"max_file_size_mb"`
+	Env           string `yaml:"env"`
+	LogLevel      string `yaml:"log_level"`
+	TempDir       string `yaml:"temp_dir"`
+	MaxFileSizeMB int    `yaml:"max_file_size_mb"`
 }
 
 type TelegramConfig struct {
-	BotToken string   `yaml:"bot_token"`
-	AdminIDs []int64  `yaml:"admin_ids"`
+	BotToken string        `yaml:"bot_token"`
+	AdminIDs []int64       `yaml:"admin_ids"`
 	Webhook  WebhookConfig `yaml:"webhook"`
 }
 
@@ -52,20 +53,20 @@ type DatabaseConfig struct {
 }
 
 type DownloaderConfig struct {
-	MaxConcurrent int    `yaml:"max_concurrent"`
-	ChunkSizeMB   int    `yaml:"chunk_size_mb"`
-	TimeoutMinutes int   `yaml:"timeout_minutes"`
-	UserAgent     string `yaml:"user_agent"`
+	MaxConcurrent  int    `yaml:"max_concurrent"`
+	ChunkSizeMB    int    `yaml:"chunk_size_mb"`
+	TimeoutMinutes int    `yaml:"timeout_minutes"`
+	UserAgent      string `yaml:"user_agent"`
 }
 
 type PlatformsConfig struct {
-	YouTube  YouTubeConfig  `yaml:"youtube"`
-	TikTok   TikTokConfig   `yaml:"tiktok"`
-	Instagram InstagramConfig `yaml:"instagram"`
-	Twitter  TwitterConfig  `yaml:"twitter"`
+	YouTube    YouTubeConfig    `yaml:"youtube"`
+	TikTok     TikTokConfig     `yaml:"tiktok"`
+	Instagram  InstagramConfig  `yaml:"instagram"`
+	Twitter    TwitterConfig    `yaml:"twitter"`
 	SoundCloud SoundCloudConfig `yaml:"soundcloud"`
-	VK       VKConfig       `yaml:"vk"`
-	Generic  GenericConfig  `yaml:"generic"`
+	VK         VKConfig         `yaml:"vk"`
+	Generic    GenericConfig    `yaml:"generic"`
 }
 
 type YouTubeConfig struct {
@@ -76,8 +77,8 @@ type YouTubeConfig struct {
 }
 
 type TikTokConfig struct {
-	Enabled    bool `yaml:"enabled"`
-	Watermark  bool `yaml:"watermark"`
+	Enabled   bool `yaml:"enabled"`
+	Watermark bool `yaml:"watermark"`
 }
 
 type InstagramConfig struct {
@@ -108,7 +109,11 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
-	var cfg Config
+	cfg := Config{
+		App:        AppConfig{Env: "development", LogLevel: "info", TempDir: "/tmp/media-downloader", MaxFileSizeMB: 50},
+		Telegram:   TelegramConfig{Webhook: WebhookConfig{Port: 8080, Path: "/webhook"}},
+		Downloader: DownloaderConfig{MaxConcurrent: 3, TimeoutMinutes: 30},
+	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
@@ -121,6 +126,7 @@ func Load(path string) (*Config, error) {
 
 	cfg.Telegram.BotToken = getEnv("BOT_TOKEN", cfg.Telegram.BotToken)
 	if ids := getEnv("ADMIN_IDS", ""); ids != "" {
+		cfg.Telegram.AdminIDs = nil
 		for _, id := range strings.Split(ids, ",") {
 			if v, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64); err == nil {
 				cfg.Telegram.AdminIDs = append(cfg.Telegram.AdminIDs, v)
@@ -152,7 +158,29 @@ func Load(path string) (*Config, error) {
 	cfg.Platforms.Generic.Enabled = getEnvBool("GENERIC_ENABLED", cfg.Platforms.Generic.Enabled)
 
 	// Setup logger
-	level, _ := logrus.ParseLevel(cfg.App.LogLevel)
+	if strings.TrimSpace(cfg.Telegram.BotToken) == "" {
+		return nil, fmt.Errorf("BOT_TOKEN is required")
+	}
+	if cfg.Downloader.MaxConcurrent <= 0 || cfg.Downloader.TimeoutMinutes <= 0 {
+		return nil, fmt.Errorf("worker count and download timeout must be positive")
+	}
+	if cfg.App.MaxFileSizeMB <= 0 {
+		return nil, fmt.Errorf("max file size must be positive")
+	}
+	// The public Bot API upload limit applies regardless of user Premium status.
+	if cfg.App.MaxFileSizeMB > 50 {
+		cfg.App.MaxFileSizeMB = 50
+	}
+	if cfg.Database.Driver != "sqlite" {
+		return nil, fmt.Errorf("only sqlite is supported")
+	}
+	if cfg.Telegram.Webhook.Enabled {
+		return nil, fmt.Errorf("webhook mode is not supported; use long polling")
+	}
+	level, err := logrus.ParseLevel(cfg.App.LogLevel)
+	if err != nil {
+		return nil, fmt.Errorf("invalid log level: %w", err)
+	}
 	logrus.SetLevel(level)
 	if cfg.App.Env == "production" {
 		logrus.SetFormatter(&logrus.JSONFormatter{})

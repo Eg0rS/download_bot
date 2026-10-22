@@ -1,54 +1,24 @@
-# Build stage
-FROM golang:1.22-alpine AS builder
-
-RUN apk add --no-cache git make gcc musl-dev
-
-WORKDIR /app
-
-# Cache dependencies
+FROM golang:1.25-alpine AS builder
+RUN apk add --no-cache gcc musl-dev
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Copy source
 COPY . .
+RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /bot ./cmd/bot
 
-# Build
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /media-downloader-bot ./cmd/bot
-
-# Runtime stage
-FROM alpine:3.20
-
-RUN apk add --no-cache \
-    ca-certificates \
-    tzdata \
-    chromium \
-    nss \
-    freetype \
-    harfbuzz \
-    ffmpeg \
-    sqlite-libs \
-    && rm -rf /var/cache/apk/*
-
-# Create non-root user
-RUN addgroup -g 1000 -S appgroup && \
-    adduser -u 1000 -S appuser -G appgroup
-
+FROM alpine:3.23
+ARG YT_DLP_VERSION=2026.10.21
+RUN apk add --no-cache ca-certificates tzdata ffmpeg python3 py3-pip nodejs \
+ && python3 -m venv /opt/ytdlp \
+ && /opt/ytdlp/bin/pip install --no-cache-dir "yt-dlp[default]==${YT_DLP_VERSION}" \
+ && addgroup -S app && adduser -S -G app -u 1000 app \
+ && mkdir -p /data /tmp/media-downloader /app \
+ && chown -R app:app /data /tmp/media-downloader /app
+ENV PATH="/opt/ytdlp/bin:$PATH"
 WORKDIR /app
-
-# Copy binary
-COPY --from=builder /media-downloader-bot .
-
-# Create directories
-RUN mkdir -p /data /tmp/media-downloader && \
-    chown -R appuser:appgroup /app /data /tmp/media-downloader
-
-USER appuser
-
-# Environment
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROME_PATH=/usr/bin/chromium
-
+COPY --from=builder /bot /app/media-downloader-bot
+COPY config.yaml /app/config.yaml
+USER app
 EXPOSE 8080
-
-ENTRYPOINT ["./media-downloader-bot"]
-CMD ["-config", "/app/config.yaml"]
+ENTRYPOINT ["/app/media-downloader-bot"]
+CMD ["-config","/app/config.yaml"]

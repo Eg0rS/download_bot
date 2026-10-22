@@ -2,9 +2,11 @@ package queue
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,6 +14,8 @@ import (
 )
 
 type DownloadRequest struct {
+	ID        string `json:"request_id"`
+	TaskID    uint   `json:"task_id"`
 	UserID    int64  `json:"user_id"`
 	ChatID    int64  `json:"chat_id"`
 	MessageID int    `json:"message_id"`
@@ -20,170 +24,197 @@ type DownloadRequest struct {
 	AudioOnly bool   `json:"audio_only"`
 	Priority  int    `json:"priority"`
 	CreatedAt int64  `json:"created_at"`
+	Attempts  int    `json:"attempts"`
 }
-
 type TaskQueue struct {
 	client *redis.Client
 	key    string
 }
 
 func NewTaskQueue(client *redis.Client) *TaskQueue {
-	return &TaskQueue{
-		client: client,
-		key:    "media_downloader:queue",
-	}
+	return &TaskQueue{client: client, key: "media_downloader:queue"}
 }
-
+func (q *TaskQueue) processingKey() string { return q.key + ":processing" }
 func (q *TaskQueue) Enqueue(req DownloadRequest) error {
-	req.CreatedAt = time.Now().Unix()
-	req.Priority = 10 // default
-
+	if req.ID == "" {
+		var id [16]byte
+		if _, err := rand.Read(id[:]); err != nil {
+			return err
+		}
+		req.ID = hex.EncodeToString(id[:])
+	}
+	if req.CreatedAt == 0 {
+		req.CreatedAt = time.Now().UnixMicro()
+	}
 	data, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
-
-	// Use sorted set with timestamp as score for FIFO
-	return q.client.ZAdd(context.Background(), q.key, redis.Z{
-		Score:  float64(req.CreatedAt),
-		Member: data,
-	}).Err()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return q.client.ZAdd(ctx, q.key, redis.Z{Score: float64(req.CreatedAt), Member: data}).Err()
 }
 
-func (q *TaskQueue) Dequeue(count int) ([]DownloadRequest, error) {
-	ctx := context.Background()
+var claimScript = redis.NewScript(`
+local items=redis.call('ZPOPMIN',KEYS[1],ARGV[1])
+local result={}
+for i=1,#items,2 do
+ redis.call('ZADD',KEYS[2],items[i+1],items[i])
+ table.insert(result,items[i])
+end
+return result
+`)
 
-	// Pop lowest score (oldest) items
-	results, err := q.client.ZPopMin(ctx, q.key, int64(count)).Result()
+func (q *TaskQueue) Dequeue(count int) ([]DownloadRequest, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := claimScript.Run(ctx, q.client, []string{q.key, q.processingKey()}, count).StringSlice()
 	if err != nil {
 		return nil, err
 	}
-
-	var tasks []DownloadRequest
-	for _, z := range results {
+	tasks := make([]DownloadRequest, 0, len(raw))
+	for _, item := range raw {
 		var req DownloadRequest
-		if err := json.Unmarshal([]byte(z.Member.(string)), &req); err != nil {
-			logrus.Errorf("Failed to unmarshal queue item: %v", err)
+		if err := json.Unmarshal([]byte(item), &req); err != nil {
+			_ = q.client.ZRem(ctx, q.processingKey(), item).Err()
+			logrus.Error("Discarded invalid queue item")
 			continue
 		}
 		tasks = append(tasks, req)
 	}
-
 	return tasks, nil
 }
 
-func (q *TaskQueue) Requeue(req DownloadRequest) error {
-	return q.Enqueue(req)
-}
+var retryScript = redis.NewScript(`
+redis.call('ZREM',KEYS[2],ARGV[1])
+return redis.call('ZADD',KEYS[1],ARGV[3],ARGV[2])
+`)
 
+func (q *TaskQueue) Requeue(req DownloadRequest) error {
+	old, _ := json.Marshal(req)
+	req.Attempts++
+	data, _ := json.Marshal(req)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return retryScript.Run(ctx, q.client, []string{q.key, q.processingKey()}, old, data, req.CreatedAt).Err()
+}
 func (q *TaskQueue) Stats() (pending, processing int, err error) {
-	ctx := context.Background()
-	pending, err = q.client.ZCard(ctx, q.key).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p, err := q.client.ZCard(ctx, q.key).Result()
 	if err != nil {
 		return 0, 0, err
 	}
-
-	// Processing tasks tracked in separate key
-	processing, err = q.client.ZCard(ctx, "media_downloader:processing").Result()
-	return pending, int(processing), err
+	active, err := q.client.ZCard(ctx, q.processingKey()).Result()
+	return int(p), int(active), err
 }
-
-func (q *TaskQueue) MarkProcessing(req DownloadRequest) error {
-	data, _ := json.Marshal(req)
-	return q.client.ZAdd(context.Background(), "media_downloader:processing", redis.Z{
-		Score:  float64(time.Now().Unix()),
-		Member: data,
-	}).Err()
-}
-
+func (q *TaskQueue) MarkProcessing(req DownloadRequest) error { return nil } // Dequeue claims atomically.
 func (q *TaskQueue) MarkDone(req DownloadRequest) error {
 	data, _ := json.Marshal(req)
-	return q.client.ZRem(context.Background(), "media_downloader:processing", data).Err()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return q.client.ZRem(ctx, q.processingKey(), data).Err()
 }
-
 func (q *TaskQueue) Len() (int64, error) {
-	return q.client.ZCard(context.Background(), q.key).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return q.client.ZCard(ctx, q.key).Result()
 }
 
-// Worker pool
+// The deployment runs one bot instance. Recover leases left by that instance.
+func (q *TaskQueue) Recover() error {
+	script := redis.NewScript(`
+local items=redis.call('ZRANGE',KEYS[2],0,-1,'WITHSCORES')
+for i=1,#items,2 do redis.call('ZADD',KEYS[1],items[i+1],items[i]) end
+redis.call('DEL',KEYS[2])
+return #items/2
+`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return script.Run(ctx, q.client, []string{q.key, q.processingKey()}).Err()
+}
+
 type WorkerPool struct {
 	queue       *TaskQueue
 	workerCount int
 	handler     func(DownloadRequest) error
 	stopCh      chan struct{}
+	stopOnce    sync.Once
+	wg          sync.WaitGroup
 }
 
-func NewWorkerPool(queue *TaskQueue, workerCount int, handler func(DownloadRequest) error) *WorkerPool {
-	return &WorkerPool{
-		queue:       queue,
-		workerCount: workerCount,
-		handler:     handler,
-		stopCh:      make(chan struct{}),
-	}
+func NewWorkerPool(q *TaskQueue, n int, handler func(DownloadRequest) error) *WorkerPool {
+	return &WorkerPool{queue: q, workerCount: n, handler: handler, stopCh: make(chan struct{})}
 }
-
 func (wp *WorkerPool) Start() {
 	for i := 0; i < wp.workerCount; i++ {
+		wp.wg.Add(1)
 		go wp.worker(i)
 	}
-	logrus.Infof("Started %d queue workers", wp.workerCount)
 }
-
-func (wp *WorkerPool) Stop() {
-	close(wp.stopCh)
+func (wp *WorkerPool) Stop() { wp.stopOnce.Do(func() { close(wp.stopCh) }); wp.wg.Wait() }
+func (wp *WorkerPool) pause(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-wp.stopCh:
+		return false
+	case <-timer.C:
+		return true
+	}
 }
-
 func (wp *WorkerPool) worker(id int) {
-	logrus.Debugf("Worker %d started", id)
+	defer wp.wg.Done()
 	for {
 		select {
 		case <-wp.stopCh:
-			logrus.Debugf("Worker %d stopped", id)
 			return
 		default:
-			tasks, err := wp.queue.Dequeue(1)
+		}
+		tasks, err := wp.queue.Dequeue(1)
+		if err != nil {
+			logrus.Errorf("Worker %d dequeue: %v", id, err)
+			if !wp.pause(time.Second) {
+				return
+			}
+			continue
+		}
+		if len(tasks) == 0 {
+			if !wp.pause(100 * time.Millisecond) {
+				return
+			}
+			continue
+		}
+		task := tasks[0]
+		err = func() (err error) {
+			defer func() {
+				if p := recover(); p != nil {
+					err = fmt.Errorf("worker panic: %v", p)
+				}
+			}()
+			return wp.handler(task)
+		}()
+		if err != nil && task.Attempts < 2 {
+			if retryErr := wp.queue.Requeue(task); retryErr != nil {
+				logrus.Errorf("Requeue: %v", retryErr)
+			}
+			if !wp.pause(time.Second) {
+				return
+			}
+		} else {
 			if err != nil {
-				logrus.Errorf("Worker %d dequeue error: %v", id, err)
-				time.Sleep(time.Second)
-				continue
+				logrus.Errorf("Task exhausted retries: %v", err)
 			}
-
-			if len(tasks) == 0 {
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-
-			task := tasks[0]
-			wp.queue.MarkProcessing(task)
-
-			logrus.Infof("Worker %d processing: %s", id, task.URL)
-			if err := wp.handler(task); err != nil {
-				logrus.Errorf("Worker %d task failed: %v", id, err)
-				// Requeue with delay/backoff
-				time.Sleep(5 * time.Second)
-				wp.queue.Requeue(task)
-			} else {
-				wp.queue.MarkDone(task)
+			if doneErr := wp.queue.MarkDone(task); doneErr != nil {
+				logrus.Errorf("Acknowledge: %v", doneErr)
 			}
 		}
 	}
 }
-
-// Helper to create Redis client from config
 func NewRedisClient(addr, password string, db int) *redis.Client {
-	return redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-		PoolSize: 10,
-	})
+	return redis.NewClient(&redis.Options{Addr: addr, Password: password, DB: db, PoolSize: 10})
 }
-
-// Parse Redis URL like redis://:password@host:port/db
-func ParseRedisURL(url string) (*redis.Options, error) {
-	opt, err := redis.ParseURL(url)
-	if err != nil {
-		return nil, err
-	}
-	return opt, nil
-}
+func ParseRedisURL(raw string) (*redis.Options, error) { return redis.ParseURL(raw) }

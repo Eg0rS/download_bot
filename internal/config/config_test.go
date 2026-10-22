@@ -65,22 +65,22 @@ platforms:
 	tmpFile, err := os.CreateTemp("", "config_*.yaml")
 	require.NoError(t, err)
 	defer os.Remove(tmpFile.Name())
-	
+
 	_, err = tmpFile.WriteString(configContent)
 	require.NoError(t, err)
 	tmpFile.Close()
-	
+
 	cfg, err := Load(tmpFile.Name())
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, "test", cfg.App.Env)
 	assert.Equal(t, "debug", cfg.App.LogLevel)
 	assert.Equal(t, "/tmp/test", cfg.App.TempDir)
-	assert.Equal(t, 1024, cfg.App.MaxFileSizeMB)
-	
+	assert.Equal(t, 50, cfg.App.MaxFileSizeMB)
+
 	assert.Equal(t, "test_token", cfg.Telegram.BotToken)
 	assert.Equal(t, []int64{123456789}, cfg.Telegram.AdminIDs)
-	
+
 	assert.Equal(t, 2, cfg.Downloader.MaxConcurrent)
 	assert.Equal(t, "720p", cfg.Platforms.YouTube.QualityPreference)
 	assert.True(t, cfg.Platforms.YouTube.DownloadSubtitles)
@@ -118,11 +118,11 @@ platforms:
 	tmpFile, err := os.CreateTemp("", "config_*.yaml")
 	require.NoError(t, err)
 	defer os.Remove(tmpFile.Name())
-	
+
 	_, err = tmpFile.WriteString(configContent)
 	require.NoError(t, err)
 	tmpFile.Close()
-	
+
 	// Set env vars
 	os.Setenv("APP_ENV", "development")
 	os.Setenv("LOG_LEVEL", "debug")
@@ -142,14 +142,14 @@ platforms:
 		os.Unsetenv("DOWNLOADER_MAX_CONCURRENT")
 		os.Unsetenv("YOUTUBE_ENABLED")
 	}()
-	
+
 	cfg, err := Load(tmpFile.Name())
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, "development", cfg.App.Env)
 	assert.Equal(t, "debug", cfg.App.LogLevel)
 	assert.Equal(t, "/tmp/env", cfg.App.TempDir)
-	assert.Equal(t, 2048, cfg.App.MaxFileSizeMB)
+	assert.Equal(t, 50, cfg.App.MaxFileSizeMB)
 	assert.Equal(t, "env_token", cfg.Telegram.BotToken)
 	assert.Equal(t, []int64{111, 222}, cfg.Telegram.AdminIDs)
 	assert.Equal(t, 5, cfg.Downloader.MaxConcurrent)

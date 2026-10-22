@@ -2,7 +2,7 @@ app:
   env: "development"  # development, production
   log_level: "debug"  # debug, info, warn, error
   temp_dir: "/tmp/media-downloader"
-  max_file_size_mb: 2048  # Telegram Premium limit
+  max_file_size_mb: 50  # Public Telegram Bot API upload limit
 
 telegram:
   bot_token: ""  # из переменной окружения BOT_TOKEN

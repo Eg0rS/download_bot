@@ -3,15 +3,17 @@ package bot
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
-	gorm "gorm.io/gorm"
 	tele "gopkg.in/telebot.v3"
+	gorm "gorm.io/gorm"
 
 	"media-downloader-bot/internal/config"
 	"media-downloader-bot/internal/extractor"
@@ -23,17 +25,32 @@ type Bot struct {
 	bot       *tele.Bot
 	cfg       *config.Config
 	db        *gorm.DB
-	registry  *extractor.Registry
-	taskQueue *queue.TaskQueue
-	active    map[int64]*models.DownloadTask // chatID -> current task
+	registry  ExtractorRegistry
+	taskQueue TaskQueue
+	mu        sync.Mutex
+	active    map[uint]activeTask
+	stopping  bool
 }
 
-func NewBot(cfg *config.Config, db *gorm.DB, registry *extractor.Registry, taskQueue *queue.TaskQueue) (*Bot, error) {
+type ExtractorRegistry interface {
+	Download(context.Context, string, string, bool, extractor.ProgressFunc) (*extractor.DownloadResult, error)
+}
+type TaskQueue interface {
+	Enqueue(queue.DownloadRequest) error
+	Stats() (int, int, error)
+}
+type activeTask struct {
+	userID, chatID int64
+	cancel         context.CancelFunc
+}
+
+func NewBot(cfg *config.Config, db *gorm.DB, registry ExtractorRegistry, taskQueue TaskQueue) (*Bot, error) {
 	pref := tele.Settings{
 		Token:  cfg.Telegram.BotToken,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+		Client: &http.Client{Timeout: 2 * time.Minute},
 		OnError: func(err error, c tele.Context) {
-			logrus.Errorf("Bot error: %v", err)
+			logrus.Errorf("Bot error: %s", strings.ReplaceAll(err.Error(), cfg.Telegram.BotToken, "[redacted]"))
 		},
 	}
 
@@ -48,7 +65,7 @@ func NewBot(cfg *config.Config, db *gorm.DB, registry *extractor.Registry, taskQ
 
 	b, err := tele.NewBot(pref)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Telegram initialization: %s", strings.ReplaceAll(err.Error(), cfg.Telegram.BotToken, "[redacted]"))
 	}
 
 	bot := &Bot{
@@ -57,7 +74,7 @@ func NewBot(cfg *config.Config, db *gorm.DB, registry *extractor.Registry, taskQ
 		db:        db,
 		registry:  registry,
 		taskQueue: taskQueue,
-		active:    make(map[int64]*models.DownloadTask),
+		active:    make(map[uint]activeTask),
 	}
 
 	bot.registerHandlers()
@@ -85,100 +102,25 @@ func (b *Bot) registerHandlers() {
 
 func (b *Bot) Start() {
 	logrus.Info("Starting bot...")
-	
-	// Add health check endpoint if webhook mode
-	if b.cfg.Telegram.Webhook.Enabled {
-		b.bot.Handle("/health", func(c tele.Context) error {
-			return c.Send("OK")
-		})
-	}
-	
+
 	b.bot.Start()
 }
 
 func (b *Bot) Stop() {
 	logrus.Info("Stopping bot...")
 	b.bot.Stop()
-	
-	// Cancel all active tasks
-	for _, task := range b.active {
-		b.cancelTask(task)
-	}
-	
-	// Wait a bit for cleanup
-	time.Sleep(2 * time.Second)
+
+	b.CancelActive()
 	logrus.Info("Bot stopped")
 }
 
 func (b *Bot) handleStart(c tele.Context) error {
-	user := c.Sender()
-	logrus.Infof("User %d (@%s) started bot", user.ID, user.Username)
-
-	text := `🎬 *Media Downloader Bot*
-
-Пришли мне ссылку на видео/аудио с популярных платформ, и я скачаю его для тебя.
-
-📋 *Поддерживаемые платформы:*
-• YouTube (видео, плейлисты, Shorts, субтитры)
-• TikTok (без водяного знака)
-• Instagram (Reels, посты, IGTV)
-• Twitter/X (видео, GIF)
-• SoundCloud (аудио)
-• Прямые ссылки на медиафайлы
-
-⚙️ *Команды:*
-/start — это сообщение
-/help — подробная помощь
-/status — статус текущей загрузки
-/cancel — отменить загрузку
-/queue — показать очередь
-
-💡 *Советы:*
-• Можно присылать несколько ссылок сразу — они встанут в очередь
-• Для YouTube можно указать качество: \`ссылка 720p\` или \`ссылка audio\`
-• Макс. размер файла: ` + fmt.Sprintf("%d МБ", b.cfg.App.MaxFileSizeMB) + `
-
-🔗 *Примеры:*
-\`https://youtu.be/dQw4w9WgXcQ\`
-\`https://www.tiktok.com/@user/video/1234567890\`
-\`https://www.instagram.com/reel/ABC123/\``
-
-	return c.Send(text, tele.ModeMarkdown)
+	return c.Send("?? Media Downloader Bot\n\n?????? ?????? ?? YouTube, TikTok, Instagram, Twitter/X, SoundCloud ??? ?????????.\n????? ???????? ????????: 720p, 1080p, best ??? audio.\n\n/help ? ???????\n/status ? ????????? ????????\n/cancel ? ???????? ???? ????????\n/queue ? ???????")
 }
 
 func (b *Bot) handleHelp(c tele.Context) error {
-	text := `📖 *Подробная помощь*
-
-*Как пользоваться:*
-1. Просто пришли ссылку — бот сам определит платформу и качество
-2. Для выбора качества добавь после ссылки: \`720p\`, \`1080p\`, \`audio\`, \`best\`
-3. Несколько ссылок можно прислать за раз (каждая с новой строки)
-
-*Примеры:*
-\`https://youtu.be/xxx 720p\` — видео 720p
-\`https://youtu.be/xxx audio\` — только аудио (mp3)
-\`https://youtu.be/xxx best\` — лучшее качество (по умолчанию)
-
-*Ограничения:*
-• Макс. размер файла: ` + fmt.Sprintf("%d МБ", b.cfg.App.MaxFileSizeMB) + ` (лимит Telegram)
-• Одновременных загрузок: ` + fmt.Sprintf("%d", b.cfg.Downloader.MaxConcurrent) + `
-• Таймаут загрузки: ` + fmt.Sprintf("%d мин", b.cfg.Downloader.TimeoutMinutes) + `
-
-*Поддерживаемые форматы:*
-• Видео: MP4, WebM, MKV
-• Аудио: MP3, M4A, OGG
-• Субтитры: SRT, VTT (встроены в видео при выборе)
-
-*Проблемы?*
-• Если видео не скачивается — попробуй позже (платформы меняют API)
-• Приватные/возрастные видео могут не работать
-• Для Instagram/TikTok/Twitter используется браузер — может быть медленнее
-
-/start — главное меню
-/status — проверить статус
-/cancel — отменить текущую загрузку`
-
-	return c.Send(text, tele.ModeMarkdown)
+	return c.Send(fmt.Sprintf("?????? ???? ?????? ?? ??????.\n\n???????:\nhttps://youtu.be/VIDEO 720p\nhttps://youtu.be/VIDEO audio\n\n???????????? ??????: %d ??.\n????????????? ????????: %d.\n???????: %d ???.\n????????? ??????? ?? ???????????. ??? ???????? ?????????? ????? ??????????? ??????????? ?? ?????????.",
+		b.cfg.App.MaxFileSizeMB, b.cfg.Downloader.MaxConcurrent, b.cfg.Downloader.TimeoutMinutes))
 }
 
 func (b *Bot) handleText(c tele.Context) error {
@@ -196,6 +138,9 @@ func (b *Bot) handleText(c tele.Context) error {
 		}
 
 		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
 		url := parts[0]
 		quality := "best"
 		audioOnly := false
@@ -211,7 +156,7 @@ func (b *Bot) handleText(c tele.Context) error {
 		}
 
 		// Basic URL validation
-		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		if extractor.ValidateURL(url) != nil {
 			continue
 		}
 
@@ -229,24 +174,36 @@ func (b *Bot) handleText(c tele.Context) error {
 		return c.Reply("❌ Не нашел ссылок в сообщении. Пришли ссылку на видео/аудио.")
 	}
 
-	// Add to queue
+	accepted := 0
+	// Persist before enqueue so pending tasks can be cancelled and survive restarts.
 	for _, task := range tasks {
+		t := &models.DownloadTask{UserID: task.UserID, ChatID: task.ChatID, MessageID: task.MessageID,
+			URL: task.URL, Quality: task.Quality, Format: map[bool]string{true: "audio", false: "video"}[task.AudioOnly], Status: models.StatusPending}
+		if err := b.db.Create(t).Error; err != nil {
+			logrus.Error(err)
+			continue
+		}
+		task.TaskID = t.ID
 		if err := b.taskQueue.Enqueue(task); err != nil {
+			b.db.Model(t).Updates(map[string]interface{}{"status": models.StatusFailed, "error": "Queue unavailable"})
 			logrus.Errorf("Failed to enqueue task: %v", err)
 			c.Reply(fmt.Sprintf("❌ Ошибка добавления в очередь: %v", err))
 			continue
 		}
+		accepted++
 	}
 
-	if len(tasks) == 1 {
+	if accepted == 0 {
+		return c.Reply("❌ Не удалось добавить задачи в очередь.")
+	}
+	if accepted == 1 {
 		return c.Reply("✅ Добавлено в очередь. Ожидайте...")
 	}
-	return c.Reply(fmt.Sprintf("✅ Добавлено %d задач в очередь.", len(tasks)))
+	return c.Reply(fmt.Sprintf("✅ Добавлено %d задач в очередь.", accepted))
 }
 
 func (b *Bot) handleCallback(c tele.Context) error {
 	data := c.Callback().Data
-	chatID := c.Chat().ID
 
 	switch {
 	case strings.HasPrefix(data, "cancel:"):
@@ -295,20 +252,29 @@ func (b *Bot) handleRetryTask(c tele.Context, taskID uint) error {
 		return c.Respond(&tele.CallbackResponse{Text: "Не твоя задача", ShowAlert: true})
 	}
 
-	// Reset status and re-queue
+	if task.Status != models.StatusFailed && task.Status != models.StatusDone {
+		return c.Respond(&tele.CallbackResponse{Text: "Задача уже выполняется"})
+	}
+	task.ID = 0
 	task.Status = models.StatusPending
 	task.Error = ""
 	task.RetryCount++
-	b.db.Save(task)
+	if err := b.db.Create(task).Error; err != nil {
+		return err
+	}
 
-	b.taskQueue.Enqueue(queue.DownloadRequest{
+	if err := b.taskQueue.Enqueue(queue.DownloadRequest{
+		TaskID:    task.ID,
 		UserID:    task.UserID,
 		ChatID:    task.ChatID,
 		MessageID: task.MessageID,
 		URL:       task.URL,
 		Quality:   task.Quality,
 		AudioOnly: task.Format == "audio",
-	})
+	}); err != nil {
+		b.db.Model(task).Updates(map[string]interface{}{"status": models.StatusFailed, "error": "Queue unavailable"})
+		return err
+	}
 
 	return c.Respond(&tele.CallbackResponse{Text: "В очереди", ShowAlert: false})
 }
@@ -327,8 +293,12 @@ func (b *Bot) handleQualitySelect(c tele.Context, taskID uint, quality string) e
 		return c.Respond(&tele.CallbackResponse{Text: "Уже в процессе", ShowAlert: true})
 	}
 
-	task.Quality = quality
-	b.db.Save(task)
+	if quality != "best" && quality != "audio" && parseQualityHeight(quality) == 0 {
+		return c.Respond(&tele.CallbackResponse{Text: "Неизвестное качество"})
+	}
+	if err := b.db.Model(task).Where("status = ?", models.StatusPending).Update("quality", quality).Error; err != nil {
+		return err
+	}
 
 	return c.Respond(&tele.CallbackResponse{Text: "Качество: " + quality, ShowAlert: false})
 }
@@ -336,11 +306,6 @@ func (b *Bot) handleQualitySelect(c tele.Context, taskID uint, quality string) e
 func (b *Bot) handleStatus(c tele.Context) error {
 	chatID := c.Chat().ID
 	userID := c.Sender().ID
-
-	// Check active task
-	if task, ok := b.active[chatID]; ok {
-		return b.sendTaskStatus(c, task)
-	}
 
 	// Check recent tasks from DB
 	var tasks []models.DownloadTask
@@ -356,18 +321,19 @@ func (b *Bot) handleStatus(c tele.Context) error {
 		text += b.formatTaskStatus(&t) + "\n"
 	}
 
-	return c.Send(text, tele.ModeMarkdown)
+	return c.Send(text)
 }
 
 func (b *Bot) handleCancel(c tele.Context) error {
-	chatID := c.Chat().ID
-
-	if task, ok := b.active[chatID]; ok {
-		b.cancelTask(task)
-		return c.Reply("❌ Текущая загрузка отменена.")
+	var tasks []models.DownloadTask
+	if err := b.db.Where("chat_id = ? AND user_id = ? AND status IN ?", c.Chat().ID, c.Sender().ID,
+		[]string{models.StatusPending, models.StatusDownloading, models.StatusProcessing}).Find(&tasks).Error; err != nil {
+		return err
 	}
-
-	return c.Reply("📭 Нет активной загрузки для отмены.")
+	for i := range tasks {
+		b.cancelTask(&tasks[i])
+	}
+	return c.Reply(fmt.Sprintf("Отменено загрузок: %d", len(tasks)))
 }
 
 func (b *Bot) handleQueue(c tele.Context) error {
@@ -392,7 +358,7 @@ func (b *Bot) handleQueue(c tele.Context) error {
 		}
 	}
 
-	return c.Send(text, tele.ModeMarkdown)
+	return c.Send(text)
 }
 
 // Admin handlers
@@ -416,11 +382,11 @@ func (b *Bot) isAdmin(userID int64) bool {
 
 func (b *Bot) handleStats(c tele.Context) error {
 	var stats struct {
-		TotalTasks    int64
-		DoneTasks     int64
-		FailedTasks   int64
-		UniqueUsers   int64
-		TotalSizeMB   int64
+		TotalTasks  int64
+		DoneTasks   int64
+		FailedTasks int64
+		UniqueUsers int64
+		TotalSizeMB int64
 	}
 
 	b.db.Model(&models.DownloadTask{}).Count(&stats.TotalTasks)
@@ -445,7 +411,7 @@ func (b *Bot) handleStats(c tele.Context) error {
 		float64(stats.TotalSizeMB)/(1024*1024*1024),
 		b.cfg.Downloader.MaxConcurrent, b.cfg.App.MaxFileSizeMB, b.cfg.Downloader.TimeoutMinutes)
 
-	return c.Send(text, tele.ModeMarkdown)
+	return c.Send(text)
 }
 
 func (b *Bot) handleBroadcast(c tele.Context) error {
@@ -457,7 +423,7 @@ func (b *Bot) handleBroadcast(c tele.Context) error {
 	msg := strings.Join(args[1:], " ")
 
 	var users []models.DownloadTask
-	b.db.Model(&models.DownloadTask{}).Distinct("user_id, chat_id").Find(&users)
+	b.db.Model(&models.DownloadTask{}).Distinct("chat_id").Find(&users)
 
 	sent := 0
 	for _, u := range users {
@@ -473,10 +439,25 @@ func (b *Bot) handleBroadcast(c tele.Context) error {
 
 // Task processing
 // ProcessTask is public so workers can call it
-func (b *Bot) ProcessTask(task *models.DownloadTask) {
-	chatID := task.ChatID
-	b.active[chatID] = task
-	defer delete(b.active, chatID)
+func (b *Bot) ProcessTask(task *models.DownloadTask) (processErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(b.cfg.Downloader.TimeoutMinutes)*time.Minute)
+	b.mu.Lock()
+	if b.stopping {
+		b.mu.Unlock()
+		cancel()
+		return context.Canceled
+	}
+	b.active[task.ID] = activeTask{userID: task.UserID, chatID: task.ChatID, cancel: cancel}
+	b.mu.Unlock()
+	defer func() {
+		cancel()
+		b.mu.Lock()
+		delete(b.active, task.ID)
+		if b.stopping {
+			processErr = context.Canceled
+		}
+		b.mu.Unlock()
+	}()
 
 	// Update status
 	b.updateTaskStatus(task, models.StatusDownloading, 0, "")
@@ -490,10 +471,26 @@ func (b *Bot) ProcessTask(task *models.DownloadTask) {
 	}
 
 	// Download
-	ctx := context.Background()
 	result, err := b.registry.Download(ctx, task.URL, task.Quality, task.Format == "audio", progress)
 	if err != nil {
 		b.handleError(task, err)
+		return
+	}
+	if result == nil {
+		b.handleError(task, fmt.Errorf("download returned no file"))
+		return
+	}
+	defer b.cleanupFile(result.FilePath)
+	if ctx.Err() != nil {
+		b.handleError(task, ctx.Err())
+		return
+	}
+	var current models.DownloadTask
+	if err := b.db.First(&current, task.ID).Error; err != nil {
+		b.handleError(task, err)
+		return
+	}
+	if current.Status == models.StatusFailed {
 		return
 	}
 
@@ -512,7 +509,7 @@ func (b *Bot) ProcessTask(task *models.DownloadTask) {
 
 	// Success
 	b.updateTaskStatus(task, models.StatusDone, 100, "")
-	b.cleanupFile(result.FilePath)
+	return
 }
 
 func (b *Bot) sendFile(task *models.DownloadTask, result *extractor.DownloadResult) error {
@@ -525,12 +522,9 @@ func (b *Bot) sendFile(task *models.DownloadTask, result *extractor.DownloadResu
 		return fmt.Errorf("file too large: %d MB > %d MB limit", fileSize/(1024*1024), b.cfg.App.MaxFileSizeMB)
 	}
 
-	// Prepare file
-	file := &tele.Document{File: tele.FromDisk(filePath), FileName: filepath.Base(filePath)}
-
 	// Caption
-	caption := fmt.Sprintf("✅ *%s*\n📥 %s\n📊 %s\n⏱ %s",
-		result.Title,
+	caption := fmt.Sprintf("✅ %s\n📥 %s\n📊 %s\n⏱ %s",
+		truncate(result.Title, 500),
 		formatBytes(fileSize),
 		result.Format.Quality,
 		formatDuration(result.Duration))
@@ -539,11 +533,11 @@ func (b *Bot) sendFile(task *models.DownloadTask, result *extractor.DownloadResu
 	var sent *tele.Message
 	var err error
 
-	if result.Format.IsVideo {
-		video := &tele.Video{File: tele.FromDisk(filePath), FileName: filepath.Base(filePath), Caption: caption}
+	if result.Format.IsVideo && result.Format.Ext == "mp4" {
+		video := &tele.Video{File: tele.FromDisk(filePath), Caption: caption}
 		sent, err = b.bot.Send(&tele.Chat{ID: task.ChatID}, video)
 	} else if result.Format.IsAudio {
-		audio := &tele.Audio{File: tele.FromDisk(filePath), FileName: filepath.Base(filePath), Caption: caption, Title: result.Title}
+		audio := &tele.Audio{File: tele.FromDisk(filePath), Caption: caption, Title: result.Title}
 		sent, err = b.bot.Send(&tele.Chat{ID: task.ChatID}, audio)
 	} else {
 		doc := &tele.Document{File: tele.FromDisk(filePath), FileName: filepath.Base(filePath), Caption: caption}
@@ -556,29 +550,44 @@ func (b *Bot) sendFile(task *models.DownloadTask, result *extractor.DownloadResu
 
 	// Update message ID for status edits
 	task.MessageID = sent.ID
-	b.db.Save(task)
+	b.db.Model(task).Update("message_id", task.MessageID)
 	return nil
 }
 
 func (b *Bot) handleError(task *models.DownloadTask, err error) {
+	if b.cfg.Telegram.BotToken != "" {
+		err = fmt.Errorf("%s", strings.ReplaceAll(err.Error(), b.cfg.Telegram.BotToken, "[redacted]"))
+	}
+	b.mu.Lock()
+	stopping := b.stopping
+	b.mu.Unlock()
+	if stopping {
+		return
+	}
+	var current models.DownloadTask
+	if b.db.First(&current, task.ID).Error == nil && current.Error == "Cancelled by user" {
+		return
+	}
 	logrus.Errorf("Task %d failed: %v", task.ID, err)
 	task.Error = err.Error()
 	b.updateTaskStatus(task, models.StatusFailed, 0, err.Error())
 
 	// Send error to user with retry button
-	btn := tele.Btn{Text: "🔄 Повторить", Data: fmt.Sprintf("retry:%d", task.ID)}
-	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.Btn{{btn}}}
+	btn := tele.InlineButton{Text: "🔄 Повторить", Data: fmt.Sprintf("retry:%d", task.ID)}
+	markup := &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{btn}}}
 
 	b.bot.Send(&tele.Chat{ID: task.ChatID},
-		fmt.Sprintf("❌ *Ошибка загрузки*\n\n%s\n\n%s", task.Title, err.Error()),
-		tele.ModeMarkdown, markup)
+		fmt.Sprintf("❌ Ошибка загрузки\n\n%s\n\n%s", truncate(task.Title, 200), truncate(err.Error(), 1500)), markup)
 }
 
 func (b *Bot) cancelTask(task *models.DownloadTask) {
-	task.Status = models.StatusFailed
-	task.Error = "Cancelled by user"
-	b.db.Save(task)
-	b.bot.Send(&tele.Chat{ID: task.ChatID}, "❌ Загрузка отменена пользователем")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.db.Model(&models.DownloadTask{}).Where("id = ? AND status IN ?", task.ID,
+		[]string{models.StatusPending, models.StatusDownloading, models.StatusProcessing}).Updates(map[string]interface{}{"status": models.StatusFailed, "error": "Cancelled by user"})
+	if active, ok := b.active[task.ID]; ok {
+		active.cancel()
+	}
 }
 
 func (b *Bot) updateTaskStatus(task *models.DownloadTask, status string, progress int, error string) {
@@ -587,7 +596,9 @@ func (b *Bot) updateTaskStatus(task *models.DownloadTask, status string, progres
 	if error != "" {
 		task.Error = error
 	}
-	b.db.Save(task)
+	b.db.Model(&models.DownloadTask{}).Where("id = ? AND status != ?", task.ID, models.StatusFailed).
+		Updates(map[string]interface{}{"status": status, "progress": progress, "error": task.Error,
+			"title": task.Title, "file_path": task.FilePath, "file_size": task.FileSize, "duration": task.Duration, "platform": task.Platform})
 }
 
 func (b *Bot) getTask(id uint) (*models.DownloadTask, error) {
@@ -603,14 +614,14 @@ func (b *Bot) sendTaskStatus(c tele.Context, task *models.DownloadTask) error {
 
 	var markup *tele.ReplyMarkup
 	if task.Status == models.StatusDownloading || task.Status == models.StatusProcessing {
-		btn := tele.Btn{Text: "❌ Отменить", Data: fmt.Sprintf("cancel:%d", task.ID)}
-		markup = &tele.ReplyMarkup{InlineKeyboard: [][]tele.Btn{{btn}}}
+		btn := tele.InlineButton{Text: "❌ Отменить", Data: fmt.Sprintf("cancel:%d", task.ID)}
+		markup = &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{btn}}}
 	} else if task.Status == models.StatusFailed {
-		btn := tele.Btn{Text: "🔄 Повторить", Data: fmt.Sprintf("retry:%d", task.ID)}
-		markup = &tele.ReplyMarkup{InlineKeyboard: [][]tele.Btn{{btn}}}
+		btn := tele.InlineButton{Text: "🔄 Повторить", Data: fmt.Sprintf("retry:%d", task.ID)}
+		markup = &tele.ReplyMarkup{InlineKeyboard: [][]tele.InlineButton{{btn}}}
 	}
 
-	return c.Send(text, tele.ModeMarkdown, markup)
+	return c.Send(text, markup)
 }
 
 func (b *Bot) formatTaskStatus(task *models.DownloadTask) string {
@@ -624,32 +635,63 @@ func (b *Bot) formatTaskStatus(task *models.DownloadTask) string {
 	}[task.Status]
 
 	platformIcon := map[string]string{
-		"youtube":   "🔴",
-		"tiktok":    "🎵",
-		"instagram": "📷",
-		"twitter":   "🐦",
+		"youtube":    "🔴",
+		"tiktok":     "🎵",
+		"instagram":  "📷",
+		"twitter":    "🐦",
 		"soundcloud": "🎧",
-		"generic":   "🔗",
+		"generic":    "🔗",
 	}[task.Platform]
 
 	progressBar := ""
 	if task.Status == models.StatusDownloading {
 		p := task.Progress
+		if p < 0 {
+			p = 0
+		}
+		if p > 100 {
+			p = 100
+		}
 		filled := p / 10
 		progressBar = fmt.Sprintf(" [%s%s] %d%%", strings.Repeat("█", filled), strings.Repeat("░", 10-filled), p)
 	}
 
-	title := task.Title
-	if len(title) > 50 {
-		title = title[:47] + "..."
-	}
+	title := truncate(task.Title, 50)
 
-	return fmt.Sprintf("%s %s *%s*%s\n🔗 `%s`", statusIcon, platformIcon, title, progressBar, task.URL)
+	return fmt.Sprintf("%s %s %s%s\n🔗 %s", statusIcon, platformIcon, title, progressBar, task.URL)
 }
 
 func (b *Bot) cleanupFile(path string) {
 	if path != "" {
 		os.Remove(path)
+		if strings.HasPrefix(filepath.Base(filepath.Dir(path)), "job_") {
+			_ = os.RemoveAll(filepath.Dir(path))
+		}
+	}
+}
+
+func truncate(text string, max int) string {
+	r := []rune(text)
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return text
+}
+
+func parseQualityHeight(q string) int {
+	h, _ := strconv.Atoi(strings.TrimSuffix(q, "p"))
+	if h < 144 || h > 4320 {
+		return 0
+	}
+	return h
+}
+
+func (b *Bot) CancelActive() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopping = true
+	for _, task := range b.active {
+		task.cancel()
 	}
 }
 

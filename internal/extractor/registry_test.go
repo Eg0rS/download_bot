@@ -39,22 +39,23 @@ func (m *MockExtractor) GetBestFormat(info *MediaInfo, qualityPref string, audio
 
 func TestRegistry_RegisterAndFind(t *testing.T) {
 	registry := NewRegistry()
-	
+
 	mockExt := new(MockExtractor)
 	mockExt.On("Name").Return("test")
 	mockExt.On("CanHandle", "https://test.com/video").Return(true)
-	
+	mockExt.On("CanHandle", "https://unknown.com/video").Return(false)
+
 	registry.Register(mockExt)
-	
+
 	// Test List
 	list := registry.List()
 	assert.Contains(t, list, "test")
-	
+
 	// Test FindForURL
 	ext, err := registry.FindForURL("https://test.com/video")
 	assert.NoError(t, err)
 	assert.Equal(t, mockExt, ext)
-	
+
 	// Test not found
 	_, err = registry.FindForURL("https://unknown.com/video")
 	assert.Error(t, err)
@@ -62,27 +63,27 @@ func TestRegistry_RegisterAndFind(t *testing.T) {
 
 func TestRegistry_MultipleExtractors(t *testing.T) {
 	registry := NewRegistry()
-	
+
 	// YouTube-like extractor
 	ytMock := new(MockExtractor)
 	ytMock.On("Name").Return("youtube")
 	ytMock.On("CanHandle", "https://youtube.com/watch?v=123").Return(true)
 	ytMock.On("CanHandle", "https://tiktok.com/video").Return(false)
-	
+
 	// TikTok-like extractor
 	ttMock := new(MockExtractor)
 	ttMock.On("Name").Return("tiktok")
 	ttMock.On("CanHandle", "https://youtube.com/watch?v=123").Return(false)
 	ttMock.On("CanHandle", "https://tiktok.com/video").Return(true)
-	
+
 	registry.Register(ytMock)
 	registry.Register(ttMock)
-	
+
 	// YouTube URL should get YouTube extractor
 	ext, err := registry.FindForURL("https://youtube.com/watch?v=123")
 	assert.NoError(t, err)
 	assert.Equal(t, "youtube", ext.Name())
-	
+
 	// TikTok URL should get TikTok extractor
 	ext, err = registry.FindForURL("https://tiktok.com/video")
 	assert.NoError(t, err)
@@ -91,7 +92,7 @@ func TestRegistry_MultipleExtractors(t *testing.T) {
 
 func TestYouTubeQualityRank(t *testing.T) {
 	ext := NewYouTubeExtractor(YouTubeConfig{})
-	
+
 	tests := []struct {
 		quality string
 		rank    int
@@ -111,7 +112,7 @@ func TestYouTubeQualityRank(t *testing.T) {
 		{"audio_only", 1},
 		{"unknown", 0},
 	}
-	
+
 	for _, tc := range tests {
 		rank := ext.qualityRank(tc.quality)
 		assert.Equal(t, tc.rank, rank, "quality: %s", tc.quality)
@@ -129,7 +130,7 @@ func TestParseHeight(t *testing.T) {
 		{"1080", 1080},
 		{"audio", 0},
 	}
-	
+
 	for _, tc := range tests {
 		result := parseHeight(tc.input)
 		assert.Equal(t, tc.expected, result, "input: %s", tc.input)

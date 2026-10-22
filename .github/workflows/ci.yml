@@ -1,0 +1,68 @@
+name: CI and deployment
+on:
+  push:
+    branches: [master, develop, main, "feature/**", "release/**", "hotfix/**"]
+  pull_request:
+    branches: [master, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Dependencies
+        run: go mod download && go mod verify
+      - name: Static analysis
+        run: go vet ./...
+      - name: Test including Redis and race detector
+        run: go test -race -count=1 -timeout=120s ./...
+      - name: Compile
+        run: go build ./cmd/bot
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release image
+        run: |
+          docker build --pull -t "media-downloader-bot:$GITHUB_SHA" .
+          docker save "media-downloader-bot:$GITHUB_SHA" | gzip > image.tar.gz
+          tar -czf release.tgz image.tar.gz docker-compose.yml config.yaml deploy/deploy.sh
+      - name: Deploy over pinned SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+          ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -i "$HOME/.ssh/deploy_key" "root@$DEPLOY_HOST" "deploy $GITHUB_SHA" < release.tgz

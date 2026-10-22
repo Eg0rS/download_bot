@@ -1,150 +1,76 @@
 # Media Downloader Bot
 
-Telegram-бот для скачивания медиа с популярных платформ: YouTube, TikTok, Instagram, Twitter/X, SoundCloud и прямых ссылок.
+Telegram-бот на Go для загрузки медиа с YouTube, TikTok, Instagram, Twitter/X, SoundCloud и прямых HTTP(S)-ссылок. Экстракторы платформ используют yt-dlp и FFmpeg. Закрытые материалы и ограничения платформ могут требовать отдельной авторизации; целые плейлисты не загружаются.
 
-## 🚀 Возможности
+![Иконка бота](assets/bot-avatar.png)
 
-| Платформа | Видео | Аудио | Субтитры | Особенности |
-|-----------|-------|-------|----------|-------------|
-| **YouTube** | ✅ | ✅ | ✅ | Плейлисты, Shorts,Live, выбор качества |
-| **TikTok** | ✅ | ✅ | ❌ | Без водяного знака |
-| **Instagram** | ✅ | ❌ | ❌ | Reels, посты, IGTV |
-| **Twitter/X** | ✅ | ❌ | ❌ | Видео, GIF |
-| **SoundCloud** | ❌ | ✅ | ❌ | Треки, плейлисты |
-| **Прямые ссылки** | ✅ | ✅ | ❌ | Любые медиафайлы |
+## Запуск
 
-## 📦 Быстрый старт (Docker)
+Нужны Docker Engine и Docker Compose v2.
 
-```bash
-# 1. Клонируй репозиторий
-git clone <repo>
-cd media-downloader-bot
-
-# 2. Настрой переменные окружения
+```sh
 cp .env.example .env
-# Отредактируй .env — обязательно укажи BOT_TOKEN
-
-# 3. Запусти
-docker compose up -d
-
-# 4. Смотри логи
+# Укажите BOT_TOKEN в .env.
+docker compose up -d --build --wait
 docker compose logs -f bot
+curl --fail http://127.0.0.1:8080/health
 ```
 
-## ⚙️ Конфигурация
+Токен хранится в игнорируемом .env. Публичный Telegram Bot API допускает загрузку файлов до 50 МБ; Premium пользователя этот лимит не увеличивает. Параметры MAX_FILE_SIZE_MB, DOWNLOADER_MAX_CONCURRENT и DOWNLOADER_TIMEOUT_MINUTES задаются в .env. Webhook пока не поддерживается: используется long polling. Health endpoint доступен только на loopback сервера.
 
-Основные настройки в `config.yaml` (перекрываются переменными из `.env`):
+Отправьте боту одну ссылку на строку:
 
-```yaml
-app:
-  max_file_size_mb: 2048  # Лимит Telegram Premium
-
-telegram:
-  bot_token: ""  # Из BOT_TOKEN
-  admin_ids: []  # Из ADMIN_IDS
-
-downloader:
-  max_concurrent: 3          # Одновременных загрузок
-  timeout_minutes: 30        # Таймаут одной загрузки
-
-platforms:
-  youtube:
-    quality_preference: "best"  # best, 1080p, 720p, audio_only
-    download_subtitles: true
-  tiktok:
-    watermark: false
+```text
+https://youtu.be/VIDEO_ID 720p
+https://youtu.be/VIDEO_ID audio
+https://example.org/video.mp4
 ```
 
-## 🎮 Использование
+Команды: /start, /help, /status, /cancel, /queue. /stats и /broadcast доступны только ADMIN_IDS. /cancel отменяет свои ожидающие и скачиваемые задачи в текущем чате; начавшуюся отправку файла в Telegram отменить нельзя.
 
-Пришли боту ссылку:
+## Разработка и Git flow
 
-```
-https://youtu.be/dQw4w9WgXcQ
-```
+- master — production, каждый push после успешного CI запускает деплой.
+- develop — интеграция изменений.
+- feature/* — задачи от develop, pull request в develop.
+- release/* — подготовка релиза из develop, pull request в master; затем синхронизация develop.
+- hotfix/* — срочные исправления от master, затем перенос в develop.
 
-С указанием качества:
-
-```
-https://youtu.be/dQw4w9WgXcQ 720p
-https://youtu.be/dQw4w9WgXcQ audio
-```
-
-Несколько ссылок сразу (каждая с новой строки):
-
-```
-https://youtu.be/xxx 1080p
-https://tiktok.com/@user/video/123
-https://instagram.com/reel/ABC/
+```sh
+go mod download
+go vet ./...
+go test -race -count=1 -timeout=120s ./...
+go build ./cmd/bot
 ```
 
-## 🛠 Команды
+Для SQLite нужен CGO и C-компилятор. Для интеграционных тестов очереди Redis должен слушать localhost:6379. В CI Redis запускается сервисом; без Redis локальные интеграционные тесты пропускаются.
 
-| Команда | Описание |
-|---------|----------|
-| `/start` | Приветствие и справка |
-| `/help` | Подробная помощь |
-| `/status` | Статус текущей загрузки |
-| `/cancel` | Отменить загрузку |
-| `/queue` | Очередь загрузок |
-| `/stats` | Статистика (админы) |
-| `/broadcast` | Рассылка (админы) |
+## CI/CD
 
-## 🏗 Архитектура
+Workflow: [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
-```
-├── cmd/bot              # Точка входа
-├── internal/
-│   ├── bot/             # Telegram-бот (telebot.v3)
-│   ├── config/          # Конфигурация (YAML + env)
-│   ├── extractor/       # Экстракторы платформ
-│   │   ├── youtube.go   # kkdai/youtube
-│   │   ├── tiktok.go    # rod (headless Chrome)
-│   │   ├── instagram.go # rod
-│   │   ├── twitter.go   # rod
-│   │   ├── generic.go   # Прямые ссылки (gen2brain/dl)
-│   │   └── registry.go  # Реестр + диспетчер
-│   ├── models/          # GORM модели (SQLite)
-│   └── queue/           # Redis очередь + worker pool
-├── Dockerfile           # Multi-stage build
-├── docker-compose.yml   # Redis + Bot
-├── config.yaml          # Конфиг по умолчанию
-├── .env.example         # Пример переменных
-└── Makefile             # Удобные команды
-```
+CI проверяет форматирование, зависимости, go vet, тесты с детектором гонок и сборку. На push в master runner собирает Docker-образ с тегом SHA коммита, передаёт его по SSH и запускает Compose. Production job сериализован; сервер дополнительно использует flock.
 
-## 🔧 Разработка
+Секреты GitHub Actions:
 
-```bash
-# Зависимости
-make deps
+| Секрет | Содержимое |
+| --- | --- |
+| DEPLOY_HOST | IP сервера |
+| DEPLOY_SSH_KEY | Отдельный приватный ключ деплоя |
+| DEPLOY_KNOWN_HOSTS | Закреплённый SSH host key сервера |
 
-# Линт
-make lint
+На сервере: /opt/media-downloader/.env с правами 600; releases/ содержит версии, current указывает на успешный релиз. Redis и SQLite хранятся в именованных Docker volumes. Токен не передаётся в CI или Docker image.
 
-# Тесты
-make test
+SSH-ключ ограничен командой deploy <SHA> через [deploy/deploy-ssh.sh](deploy/deploy-ssh.sh). [deploy/deploy.sh](deploy/deploy.sh) загружает image, выполняет docker compose up --wait и проверяет /health. При ошибке возвращает предыдущий образ. Первый деплой не имеет предыдущего релиза для отката. Автоматический откат не откатывает схему SQLite: несовместимые миграции требуют отдельного плана.
 
-# Сборка
-make build
+## Иконка
 
-# Запуск локально
-make run
-```
+[assets/bot-avatar.png](assets/bot-avatar.png) — аватар, созданный встроенным image_gen. Промпт сохранён в [assets/README.md](assets/README.md).
 
-### Добавление новой платформы
+## Результаты ревью
 
-1. Создай `internal/extractor/<platform>.go` реализуя интерфейс `Extractor`
-2. Зарегистрируй в `main.go` при инициализации `registry`
-3. Добавь конфиг в `config.yaml` и `internal/config/config.go`
+Исправлены несуществующие зависимости и ошибки компиляции, пустые реализации скачивания, гонки карты задач, отмена без context cancellation, игнорирование таймаута, потеря порядка и дублирование записей очереди, зависание теста worker pool, утечки файлов, потеря метаданных и отсутствие HTTP healthcheck.
 
-## 📝 Лицензия
+Выдача задач в Redis атомарно переносит их в processing. При запуске единственного экземпляра бота незавершённые задания возвращаются в очередь. Задачи сохраняются в SQLite до постановки в очередь; права на отмену проверяются по пользователю и чату. Доставка имеет семантику at least once: если процесс завершится после отправки файла, но до записи результата в SQLite, повторная отправка возможна.
 
-MIT — используй на свой страх и риск. Соблюдай ToS платформ и авторские права.
-
-## ⚠️ Важные замечания
-
-- **YouTube**: использует внутренний API, может ломаться при изменениях на стороне Google
-- **TikTok/Instagram/Twitter**: требуют headless Chrome (Chromium в Docker) — медленнее и тяжелее
-- **Размер файла**: Telegram Bot API ограничивает 50 МБ для ботов, 2 ГБ для Premium — бот проверяет лимит
-- **Авторские права**: скачивай только разрешенный контент для личного использования
+Прямые загрузки проверяют DNS на каждом подключении и редиректе, запрещают приватные адреса, контролируют размер потока и удаляют неполные файлы. yt-dlp допускается только для перечисленных доменов платформ; сетевые запросы внутри yt-dlp и FFmpeg требуют доверия к самим платформам.

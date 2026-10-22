@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,156 +25,149 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "Path to config file")
+	path := flag.String("config", "config.yaml", "Path to configuration")
 	flag.Parse()
-
-	// Load .env if exists
+	if err := run(*path); err != nil {
+		logrus.Fatal(err)
+	}
+}
+func run(path string) error {
 	_ = godotenv.Load()
-
-	// Load config
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(path)
 	if err != nil {
-		logrus.Fatalf("Failed to load config: %v", err)
+		return err
 	}
-
-	logrus.Info("Starting Media Downloader Bot...")
-
-	// Database
-	db, err := gorm.Open(sqlite.Open(cfg.Database.DSN), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
+	// The same limits and location are used by subprocesses and HTTP downloads.
+	_ = os.Setenv("TEMP_DIR", cfg.App.TempDir)
+	_ = os.Setenv("MAX_FILE_SIZE_MB", fmt.Sprint(cfg.App.MaxFileSizeMB))
+	if err := os.MkdirAll(cfg.App.TempDir, 0700); err != nil {
+		return err
+	}
+	db, err := gorm.Open(sqlite.Open(cfg.Database.DSN), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
-		logrus.Fatalf("Failed to connect to database: %v", err)
+		return err
 	}
-
-	// Auto-migrate
-	if err := db.AutoMigrate(&models.DownloadTask{}, &models.MediaInfo{}); err != nil {
-		logrus.Fatalf("Failed to migrate database: %v", err)
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
 	}
-
-	// Redis
-	redisClient := queue.NewRedisClient(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+	defer sqlDB.Close()
+	sqlDB.SetMaxOpenConns(1) // SQLite has a single writer.
+	if err = db.Exec("PRAGMA journal_mode=WAL").Error; err != nil {
+		return err
+	}
+	if err = db.Exec("PRAGMA busy_timeout=5000").Error; err != nil {
+		return err
+	}
+	if err = db.AutoMigrate(&models.DownloadTask{}, &models.MediaInfo{}); err != nil {
+		return err
+	}
+	client := queue.NewRedisClient(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		logrus.Fatalf("Failed to connect to Redis: %v", err)
+	err = client.Ping(ctx).Err()
+	cancel()
+	if err != nil {
+		return err
 	}
-	logrus.Info("Connected to Redis")
-
-	// Extractors registry
 	registry := extractor.NewRegistry()
-
-	// Register YouTube
+	defer registry.Close()
 	if cfg.Platforms.YouTube.Enabled {
-		ytCfg := extractor.YouTubeConfig{
-			QualityPreference: cfg.Platforms.YouTube.QualityPreference,
-			DownloadSubtitles: cfg.Platforms.YouTube.DownloadSubtitles,
-			SubtitleLangs:     cfg.Platforms.YouTube.SubtitleLangs,
-		}
-		registry.Register(extractor.NewYouTubeExtractor(ytCfg))
+		registry.Register(extractor.NewYouTubeExtractor(extractor.YouTubeConfig{QualityPreference: cfg.Platforms.YouTube.QualityPreference, DownloadSubtitles: cfg.Platforms.YouTube.DownloadSubtitles, SubtitleLangs: cfg.Platforms.YouTube.SubtitleLangs}))
 	}
-
-	// Register TikTok (requires headless Chrome)
 	if cfg.Platforms.TikTok.Enabled {
-		ttCfg := extractor.TikTokConfig{Watermark: cfg.Platforms.TikTok.Watermark}
-		if ext, err := extractor.NewTikTokExtractor(ttCfg); err != nil {
-			logrus.Warnf("Failed to init TikTok extractor: %v", err)
-		} else {
-			registry.Register(ext)
+		e, err := extractor.NewTikTokExtractor(extractor.TikTokConfig{Watermark: cfg.Platforms.TikTok.Watermark})
+		if err != nil {
+			return err
 		}
+		registry.Register(e)
 	}
-
-	// Register Instagram
 	if cfg.Platforms.Instagram.Enabled {
-		igCfg := extractor.InstagramConfig{Enabled: true}
-		if ext, err := extractor.NewInstagramExtractor(igCfg); err != nil {
-			logrus.Warnf("Failed to init Instagram extractor: %v", err)
-		} else {
-			registry.Register(ext)
+		e, err := extractor.NewInstagramExtractor(extractor.InstagramConfig{Enabled: true})
+		if err != nil {
+			return err
 		}
+		registry.Register(e)
 	}
-
-	// Register Twitter/X
 	if cfg.Platforms.Twitter.Enabled {
-		twCfg := extractor.TwitterConfig{Enabled: true}
-		if ext, err := extractor.NewTwitterExtractor(twCfg); err != nil {
-			logrus.Warnf("Failed to init Twitter extractor: %v", err)
-		} else {
-			registry.Register(ext)
+		e, err := extractor.NewTwitterExtractor(extractor.TwitterConfig{Enabled: true})
+		if err != nil {
+			return err
 		}
+		registry.Register(e)
 	}
-
-	// Register Generic (fallback)
+	if cfg.Platforms.SoundCloud.Enabled {
+		e, err := extractor.NewSoundCloudExtractor(extractor.SoundCloudConfig{Enabled: true})
+		if err != nil {
+			return err
+		}
+		registry.Register(e)
+	}
 	if cfg.Platforms.Generic.Enabled {
 		registry.Register(extractor.NewGenericExtractor(extractor.GenericConfig{Enabled: true}))
 	}
-
-	logrus.Infof("Registered extractors: %v", registry.List())
-
-	// Task queue
-	taskQueue := queue.NewTaskQueue(redisClient)
-
-	// Bot
-	b, err := bot.NewBot(cfg, db, registry, taskQueue)
+	q := queue.NewTaskQueue(client)
+	if err = q.Recover(); err != nil {
+		return err
+	}
+	b, err := bot.NewBot(cfg, db, registry, q)
 	if err != nil {
-		logrus.Fatalf("Failed to create bot: %v", err)
+		return err
 	}
-
-	// Worker pool for processing queue
-	workerPool := queue.NewWorkerPool(taskQueue, cfg.Downloader.MaxConcurrent, func(req queue.DownloadRequest) error {
-		// Create task in DB
-		task := &models.DownloadTask{
-			UserID:     req.UserID,
-			ChatID:     req.ChatID,
-			MessageID:  req.MessageID,
-			URL:        req.URL,
-			Quality:    req.Quality,
-			Format:     map[bool]string{true: "audio", false: "video"}[req.AudioOnly],
-			Status:     models.StatusPending,
-			Priority:   req.Priority,
+	workers := queue.NewWorkerPool(q, cfg.Downloader.MaxConcurrent, func(req queue.DownloadRequest) error {
+		task := &models.DownloadTask{}
+		if req.TaskID != 0 {
+			if err := db.First(task, req.TaskID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			if task.Status == models.StatusDone || task.Status == models.StatusFailed {
+				return nil
+			}
+		} else {
+			task = &models.DownloadTask{UserID: req.UserID, ChatID: req.ChatID, MessageID: req.MessageID, URL: req.URL, Quality: req.Quality, Format: map[bool]string{true: "audio", false: "video"}[req.AudioOnly], Status: models.StatusPending}
+			if err := db.Create(task).Error; err != nil {
+				return err
+			}
 		}
-		if err := db.Create(task).Error; err != nil {
-			return err
+		if ext, err := registry.FindForURL(task.URL); err == nil {
+			task.Platform = ext.Name()
 		}
-
-		// Process (this runs in worker goroutine)
-		b.ProcessTask(task)
-		return nil
+		return b.ProcessTask(task)
 	})
-	workerPool.Start()
-
-	// Start bot
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if client.Ping(ctx).Err() != nil || sqlDB.PingContext(ctx) != nil {
+			http.Error(w, "unhealthy", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	server := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.ListenAndServe() }()
+	workers.Start()
 	go b.Start()
-
-	// Wait for shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigCh
-
-	logrus.Infof("Received signal %v, shutting down...", sig)
-	
-	// Graceful shutdown with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-	
-	done := make(chan struct{})
-	go func() {
-		workerPool.Stop()
-		b.Stop()
-		registry.Close()
-		redisClient.Close()
-		
-		sqlDB, _ := db.DB()
-		sqlDB.Close()
-		close(done)
-	}()
-	
+	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 	select {
-	case <-done:
-		logrus.Info("Graceful shutdown completed")
-	case <-shutdownCtx.Done():
-		logrus.Warn("Shutdown timeout, forcing exit")
+	case <-signalCtx.Done():
+	case err = <-serverErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			logrus.Error(err)
+		}
 	}
-	
-	fmt.Println("Bot stopped gracefully")
+	b.CancelActive()
+	// Workers finish before databases, extractors and connections are closed.
+	workers.Stop()
+	b.Stop()
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.Shutdown(shutdown)
+	return err
 }

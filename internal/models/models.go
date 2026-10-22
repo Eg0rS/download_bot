@@ -7,27 +7,27 @@ import (
 )
 
 type DownloadTask struct {
-	ID          uint           `gorm:"primarykey" json:"id"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
-	DeletedAt   gorm.DeletedAt `gorm:"index" json:"-"`
+	ID        uint           `gorm:"primarykey" json:"id"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 
-	UserID      int64  `gorm:"index" json:"user_id"`
-	ChatID      int64  `gorm:"index" json:"chat_id"`
-	MessageID   int    `json:"message_id"`
-	URL         string `gorm:"size:2048" json:"url"`
-	Platform    string `gorm:"size:50;index" json:"platform"`
-	Status      string `gorm:"size:20;index" json:"status"` // pending, downloading, processing, uploading, done, failed
-	Progress    int    `json:"progress"` // 0-100
-	Title       string `gorm:"size:512" json:"title"`
-	FilePath    string `gorm:"size:1024" json:"file_path,omitempty"`
-	FileSize    int64  `json:"file_size"`
-	Duration    int    `json:"duration"` // seconds
-	Error       string `gorm:"size:1024" json:"error,omitempty"`
-	Quality     string `gorm:"size:50" json:"quality"`
-	Format      string `gorm:"size:20" json:"format"`
-	RetryCount  int    `json:"retry_count"`
-	Priority    int    `json:"priority"`
+	UserID     int64  `gorm:"index" json:"user_id"`
+	ChatID     int64  `gorm:"index" json:"chat_id"`
+	MessageID  int    `json:"message_id"`
+	URL        string `gorm:"size:2048" json:"url"`
+	Platform   string `gorm:"size:50;index" json:"platform"`
+	Status     string `gorm:"size:20;index" json:"status"` // pending, downloading, processing, uploading, done, failed
+	Progress   int    `json:"progress"`                    // 0-100
+	Title      string `gorm:"size:512" json:"title"`
+	FilePath   string `gorm:"size:1024" json:"file_path,omitempty"`
+	FileSize   int64  `json:"file_size"`
+	Duration   int    `json:"duration"` // seconds
+	Error      string `gorm:"size:1024" json:"error,omitempty"`
+	Quality    string `gorm:"size:50" json:"quality"`
+	Format     string `gorm:"size:20" json:"format"`
+	RetryCount int    `json:"retry_count"`
+	Priority   int    `json:"priority"`
 }
 
 type MediaInfo struct {

@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.local/
+bin/
+*.db
+*.db-shm
+*.db-wal
+*.exe
+coverage.out
+media-downloader-bot

@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
@@ -112,8 +113,8 @@ func setupTestConfig() *config.Config {
 			AdminIDs: []int64{123456789},
 		},
 		Downloader: config.DownloaderConfig{
-			MaxConcurrent:   1,
-			TimeoutMinutes:  30,
+			MaxConcurrent:  1,
+			TimeoutMinutes: 30,
 		},
 	}
 }
@@ -124,29 +125,70 @@ func TestBot_CancelTask(t *testing.T) {
 	registry := new(MockExtractorRegistry)
 	taskQueue := new(MockTaskQueue)
 
-	b, err := NewBot(cfg, db, registry, taskQueue)
-	assert.NoError(t, err)
+	b := &Bot{cfg: cfg, db: db, registry: registry, taskQueue: taskQueue, active: make(map[uint]activeTask)}
 
 	// Create a task
 	task := &models.DownloadTask{
-		UserID:    123456789,
-		ChatID:    987654321,
-		URL:       "https://youtube.com/watch?v=test",
-		Status:    models.StatusDownloading,
-		Progress:  50,
+		UserID:   123456789,
+		ChatID:   987654321,
+		URL:      "https://youtube.com/watch?v=test",
+		Status:   models.StatusDownloading,
+		Progress: 50,
 	}
 	db.Create(task)
 
 	// Add to active
-	b.ActiveTasks()[task.ChatID] = task
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.active[task.ID] = activeTask{userID: task.UserID, chatID: task.ChatID, cancel: cancel}
 
 	// Cancel
-	b.CancelTaskForTest(task)
+	b.cancelTask(task)
+	assert.Error(t, ctx.Err())
 
 	// Verify
 	db.First(task, task.ID)
 	assert.Equal(t, models.StatusFailed, task.Status)
 	assert.Equal(t, "Cancelled by user", task.Error)
+	// A late progress callback must not resurrect a cancelled task.
+	b.updateTaskStatus(task, models.StatusDownloading, 90, "")
+	var persisted models.DownloadTask
+	require.NoError(t, db.First(&persisted, task.ID).Error)
+	assert.Equal(t, models.StatusFailed, persisted.Status)
+	assert.Equal(t, "Cancelled by user", persisted.Error)
+}
+
+type blockingRegistry struct{ started chan struct{} }
+
+func (r *blockingRegistry) Download(ctx context.Context, raw, quality string, audio bool, progress extractor.ProgressFunc) (*extractor.DownloadResult, error) {
+	close(r.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestShutdownInterruptsDownloadForRequeue(t *testing.T) {
+	db := setupTestDB()
+	r := &blockingRegistry{started: make(chan struct{})}
+	b := &Bot{cfg: setupTestConfig(), db: db, registry: r, active: make(map[uint]activeTask)}
+	task := &models.DownloadTask{UserID: 1, ChatID: 1, URL: "https://youtu.be/test", Status: models.StatusPending}
+	require.NoError(t, db.Create(task).Error)
+	done := make(chan error, 1)
+	go func() { done <- b.ProcessTask(task) }()
+	select {
+	case <-r.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("download did not start")
+	}
+	b.CancelActive()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(3 * time.Second):
+		t.Fatal("shutdown did not cancel download")
+	}
+	var persisted models.DownloadTask
+	require.NoError(t, db.First(&persisted, task.ID).Error)
+	require.NotEqual(t, models.StatusFailed, persisted.Status)
 }
 
 func TestBot_FormatBytes(t *testing.T) {
@@ -189,8 +231,8 @@ func TestBot_FormatDuration(t *testing.T) {
 func TestBot_ParseQuality(t *testing.T) {
 	// Test quality parsing logic
 	tests := []struct {
-		input    string
-		quality  string
+		input     string
+		quality   string
 		audioOnly bool
 	}{
 		{"https://youtube.com/watch?v=123 720p", "720p", false},
@@ -254,13 +296,4 @@ func splitFields(s string) []string {
 		result = append(result, current)
 	}
 	return result
-}
-
-// Add test helpers to Bot (only for testing)
-func (b *Bot) ActiveTasks() map[int64]*models.DownloadTask {
-	return b.active
-}
-
-func (b *Bot) CancelTaskForTest(task *models.DownloadTask) {
-	b.cancelTask(task)
 }
